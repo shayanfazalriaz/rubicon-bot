@@ -1,5 +1,7 @@
+# rubicon_bot.py — Rubicon Production (RU/UZ/EN) + Excel + webhook для Render Web Service
+# Требует: python-telegram-bot==20.7, openpyxl
+
 import os
-import os as _os
 import logging
 from datetime import datetime
 from typing import Dict, Any
@@ -10,18 +12,20 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
-# 1) Токен берём из переменной окружения
+# ─────────────────────────────────────────────────────────────────────────────
+# Токен берём из переменной окружения (Render → Environment → BOT_TOKEN)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-ADMIN_FILE = "admin_id.txt"
+# Файлы (на Render это эфемерная ФС — после перезапуска могут исчезать)
+ADMIN_FILE = "admin_id.txt"   # где запоминаем chat_id администратора
+EXCEL_FILE = "requests.xlsx"  # локальный Excel для /export
+
+# Память в процессе
 ADMIN_ID: int | None = None
-
-user_lang: Dict[int, str] = {}
-forms: Dict[int, Dict[str, Any]] = {}
-
-EXCEL_FILE = "requests.xlsx"  # на Render файл не постоянный; годится для /export здесь и сейчас
+user_lang: Dict[int, str] = {}           # user_id -> "ru" | "uz" | "en"
+forms: Dict[int, Dict[str, Any]] = {}    # user_id -> {"step": int, "data": {...}}
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -29,6 +33,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("rubicon")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Локализация
 T = {
     "ru": {
         "welcome": "👋 <b>Rubicon Production</b>\nВыберите язык и нажмите «Заполнить заявку».",
@@ -101,6 +107,9 @@ T = {
     }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Вспомогательное
+
 def get_lang(uid: int) -> str:
     return user_lang.get(uid, "ru")
 
@@ -127,9 +136,12 @@ def render_card(d: Dict[str, str]) -> str:
         f"<b>Email:</b> {d.get('email','—')}"
     )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN_ID persistence
+
 def load_admin_id():
     global ADMIN_ID
-    if _os.path.exists(ADMIN_FILE):
+    if os.path.exists(ADMIN_FILE):
         try:
             ADMIN_ID = int(open(ADMIN_FILE, "r", encoding="utf-8").read().strip())
         except Exception:
@@ -139,19 +151,22 @@ def save_admin_id(admin_id: int):
     with open(ADMIN_FILE, "w", encoding="utf-8") as f:
         f.write(str(admin_id))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel (openpyxl)
+
 def excel_append(lang: str, data: Dict[str, str], user):
-    # лёгкая локальная запись — на Render может «сбрасываться» после рестарта
+    """Добавляет строку в requests.xlsx. При первом запуске создаёт файл и шапку."""
     try:
         from openpyxl import Workbook, load_workbook
         from openpyxl.utils import get_column_letter
     except Exception as e:
-        log.warning("openpyxl не установлен: %s", e)
+        log.warning("openpyxl не установлен или не доступен: %s", e)
         return
 
     headers = ["Timestamp(UTC)", "Lang", "FIO+Company", "Phone", "Telegram",
                "Task", "Email", "UserID", "Username"]
 
-    if not _os.path.exists(EXCEL_FILE):
+    if not os.path.exists(EXCEL_FILE):
         wb = Workbook()
         ws = wb.active
         ws.title = "Requests"
@@ -173,14 +188,18 @@ def excel_append(lang: str, data: Dict[str, str], user):
         f"@{getattr(user, 'username', '')}" if getattr(user, "username", None) else "",
     ]
     ws.append(row)
-    if ws.max_row == 2:
+
+    if ws.max_row == 2:  # первая запись — зададим ширины колонок
         for col in range(1, ws.max_column + 1):
             col_letter = get_column_letter(col)
             max_len = max(len(str(cell.value)) if cell.value else 0 for cell in ws[col_letter])
             ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
+
     wb.save(EXCEL_FILE)
 
-# ─── Handlers ───
+# ─────────────────────────────────────────────────────────────────────────────
+# Handlers
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = get_lang(uid)
@@ -208,7 +227,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_lang(update.effective_user.id)
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text(T[lang]["no_rights"]); return
-    if not _os.path.exists(EXCEL_FILE):
+    if not os.path.exists(EXCEL_FILE):
         await update.message.reply_text(T[lang]["export_none"]); return
     await update.message.reply_text(T[lang]["export_ok"])
     try:
@@ -222,8 +241,8 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text(T[lang]["no_rights"]); return
     try:
-        if _os.path.exists(EXCEL_FILE):
-            _os.remove(EXCEL_FILE)
+        if os.path.exists(EXCEL_FILE):
+            os.remove(EXCEL_FILE)
         await update.message.reply_text(T[lang]["cleared"])
     except Exception as e:
         log.error("Clear failed: %s", e)
@@ -257,23 +276,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = get_lang(uid)
     txt = (update.message.text or "").strip()
-    if uid not in forms: return
-    st = forms[uid]["step"]; d = forms[uid]["data"]
+
+    if uid not in forms:
+        return
+
+    st = forms[uid]["step"]
+    d = forms[uid]["data"]
 
     if st == 1:
-        d["fio_company"] = txt; forms[uid]["step"] = 2
+        d["fio_company"] = txt
+        forms[uid]["step"] = 2
         await update.message.reply_text(T[lang]["ask_phone"], parse_mode="HTML"); return
+
     if st == 2:
-        d["phone"] = txt; forms[uid]["step"] = 3
+        d["phone"] = txt
+        forms[uid]["step"] = 3
         await update.message.reply_text(T[lang]["ask_tg"], parse_mode="HTML"); return
+
     if st == 3:
-        d["tg"] = txt.lstrip("@"); forms[uid]["step"] = 4
+        d["tg"] = txt.lstrip("@")
+        forms[uid]["step"] = 4
         await update.message.reply_text(T[lang]["ask_task"], parse_mode="HTML"); return
+
     if st == 4:
-        d["task"] = txt; forms[uid]["step"] = 5
+        d["task"] = txt
+        forms[uid]["step"] = 5
         await update.message.reply_text(T[lang]["ask_email"], parse_mode="HTML"); return
+
     if st == 5:
-        d["email"] = txt; forms[uid]["step"] = 6
+        d["email"] = txt
+        forms[uid]["step"] = 6
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(T[lang]["btn_confirm"], callback_data="form:confirm"),
             InlineKeyboardButton(T[lang]["btn_cancel"], callback_data="form:cancel"),
@@ -298,31 +330,60 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ADMIN_ID:
             try:
                 await context.bot.send_message(
-                    chat_id=ADMIN_ID, text=f"{T[lang]['sent_admin']}\n\n{render_card(d)}", parse_mode="HTML"
+                    chat_id=ADMIN_ID,
+                    text=f"{T[lang]['sent_admin']}\n\n{render_card(d)}",
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 log.error("Send to admin failed: %s", e)
         else:
             await q.message.reply_text(T[lang]["not_admin"])
+
         try:
             excel_append(lang, d, q.from_user)
         except Exception as e:
             log.error("Excel append failed: %s", e)
+
         await q.edit_message_text(T[lang]["sent_user"], parse_mode="HTML", reply_markup=main_menu(lang))
         forms.pop(uid, None); return
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Запуск: локально — polling; на Render Web — webhook.
+
+def run(app):
+    base_url = os.getenv("RENDER_EXTERNAL_URL")  # Render выставляет, когда это Web Service
+    port = int(os.getenv("PORT", "10000"))       # Render даёт порт через env
+
+    if base_url:
+        path = f"/webhook/{BOT_TOKEN}"
+        webhook_url = f"{base_url}{path}"
+        print(f">>> Using webhook on {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=path,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        print(">>> Using polling (local run)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
     load_admin_id()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("pingadmin", cmd_pingadmin))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("clear", cmd_clear))
+
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^(set_lang:(ru|uz|en)|lang:open|form:start)$"))
     app.add_handler(CallbackQueryHandler(on_form_control, pattern="^form:(confirm|cancel)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    run(app)
 
 if __name__ == "__main__":
     print(">>> Rubicon bot booting…")
