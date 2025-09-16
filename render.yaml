@@ -1,5 +1,5 @@
 services:
-  - type: web            # ← было: worker
+  - type: web              # web-сервис (на free-плане разрешён)
     name: rubicon-bot
     env: python
     plan: free
