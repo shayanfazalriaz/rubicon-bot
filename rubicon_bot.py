@@ -236,14 +236,41 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=lang_menu(lang)
     )
 
+# ЗАПРЕЩАЕМ /admin всем, кроме действующего админа.
+# Если админ ещё не зафиксирован (ADMIN_ID = None), разрешаем только:
+#  - пользователю с username == ADMIN_USERNAME (если задан)
+#  - ИЛИ по секретному ключу ADMIN_KEY через: /admin <ключ>  (опционально)
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручное закрепление админа (полезно вне Render). На Render лучше задать ADMIN_ID/ADMIN_USERNAME."""
     global ADMIN_ID
     user = update.effective_user
+    lang = get_lang(user.id)
+
+    ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+
+    def is_username_allowed(u: User) -> bool:
+        return bool(ADMIN_USERNAME_ENV) and (u.username or "").lower() == ADMIN_USERNAME_ENV
+
+    def key_matches() -> bool:
+        return bool(ADMIN_KEY) and len(context.args) >= 1 and context.args[0] == ADMIN_KEY
+
+    allowed = False
+
+    if ADMIN_ID is not None:
+        # Админ уже назначен — только он может выполнять /admin
+        allowed = (user.id == ADMIN_ID)
+    else:
+        # Админ ещё не назначен — разрешаем только «хозяину» по нику или по ключу
+        allowed = is_username_allowed(user) or key_matches()
+
+    if not allowed:
+        await update.message.reply_text(T[lang]["no_rights"])
+        return
+
+    # Назначаем/переназначаем админа (разрешено только действующему)
     ADMIN_ID = user.id
     save_admin_id_to_file(ADMIN_ID)
-    lang = get_lang(user.id)
     await update.message.reply_text(T[lang]["admin_set"])
+
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -408,3 +435,4 @@ def main():
 if __name__ == "__main__":
     print(">>> Rubicon bot booting…")
     main()
+
