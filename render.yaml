@@ -1,10 +1,7 @@
 services:
-  - type: worker
+  - type: web            # ← было: worker
     name: rubicon-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python rubicon_bot.py
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
