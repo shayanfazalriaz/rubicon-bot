@@ -1,28 +1,33 @@
-# rubicon_bot.py — Rubicon Production (RU/UZ/EN) + Excel + webhook для Render Web Service
-# Требует: python-telegram-bot==20.7, openpyxl
+# rubicon_bot.py — Rubicon Production (RU/UZ/EN) + Excel + webhook для Render
+# Требует: python-telegram-bot[webhooks]==20.7, openpyxl
 
 import os
 import logging
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, User
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
 
-# ── НАСТРОЙКИ ─────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # задай в Render → Environment
+# ── КОНФИГ ─────────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
 
-ADMIN_FILE = "admin_id.txt"   # где запоминаем chat_id администратора
-EXCEL_FILE = "requests.xlsx"  # локальный Excel для /export (на free Render не постоянен)
+# стабильные источники для администратора (persist на Render):
+ADMIN_ID_ENV = os.getenv("ADMIN_ID")  # строка -> int
+ADMIN_USERNAME_ENV = (os.getenv("ADMIN_USERNAME") or "").strip().lstrip("@").lower()
 
-ADMIN_ID: int | None = None
-user_lang: Dict[int, str] = {}        # user_id -> "ru" | "uz" | "en"
-forms: Dict[int, Dict[str, Any]] = {} # user_id -> {"step": int, "data": {...}}
+ADMIN_FILE = "admin_id.txt"            # вспомогательный локальный кэш (может пропадать на free)
+EXCEL_FILE = "requests.xlsx"           # локальный Excel для /export (на free Render не постоянен)
+
+# память процесса
+ADMIN_ID: Optional[int] = None
+user_lang: Dict[int, str] = {}
+forms: Dict[int, Dict[str, Any]] = {}
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -47,13 +52,14 @@ T = {
         "btn_confirm": "✅ Подтвердить и отправить", "btn_cancel": "✖️ Отмена",
         "sent_user": "✅ Заявка отправлена! Мы свяжемся с вами.",
         "sent_admin": "📩 Новая заявка:",
-        "not_admin": "Админ не назначен. Выполните /admin с админ-аккаунта.",
+        "not_admin": "Админ не назначен. Напишите админу или используйте /whoami чтобы занести ADMIN_ID в Render.",
         "admin_set": "✅ Вы назначены администратором и будете получать заявки.",
         "cancelled": "❌ Отменено. Для новой заявки нажмите «📝 Заполнить заявку».",
         "export_ok": "📎 Отправляю текущий Excel с заявками.",
         "export_none": "🗂 Файл ещё не создан (нет заявок).",
-        "cleared": "🧹 Готово: локальный Excel удалён. Новые заявки начнут файл с чистого листа.",
+        "cleared": "🧹 Готово: локальный Excel удалён.",
         "no_rights": "Только администратор может использовать эту команду.",
+        "whoami": "🆔 Ваш chat_id: <code>{}</code>\nСовет: добавьте его в Render → Environment переменной <code>ADMIN_ID</code>.",
     },
     "uz": {
         "welcome": "👋 <b>Rubicon Production</b>\nTilni tanlang va «Ariza yuborish» tugmasini bosing.",
@@ -70,13 +76,14 @@ T = {
         "btn_confirm": "✅ Tasdiqlash", "btn_cancel": "✖️ Bekor qilish",
         "sent_user": "✅ Arizangiz yuborildi! Tez orada bog‘lanamiz.",
         "sent_admin": "📩 Yangi ariza:",
-        "not_admin": "Admin belgilanmagan. /admin yuboring.",
+        "not_admin": "Admin belgilanmagan. /whoami ni yuboring va ADMIN_ID ni Render ga qo‘shing.",
         "admin_set": "✅ Admin sifatida belgilandingiz.",
         "cancelled": "❌ Bekor qilindi.",
         "export_ok": "📎 Joriy Excel faylini yuboraman.",
         "export_none": "🗂 Fayl hali yaratilmagan (arizalar yo‘q).",
         "cleared": "🧹 Tayyor: Excel tozalandi.",
         "no_rights": "Bu buyruqni faqat admin ishlatishi mumkin.",
+        "whoami": "🆔 Sizning chat_id: <code>{}</code>\nMaslahat: Render → Environment ga <code>ADMIN_ID</code> sifatida qo‘shing.",
     },
     "en": {
         "welcome": "👋 <b>Rubicon Production</b>\nChoose language and tap “Submit request”.",
@@ -93,17 +100,18 @@ T = {
         "btn_confirm": "✅ Confirm & send", "btn_cancel": "✖️ Cancel",
         "sent_user": "✅ Request sent! We will contact you shortly.",
         "sent_admin": "📩 New request:",
-        "not_admin": "Admin not set. Use /admin from admin account.",
-        "admin_set": "✅ You are set as admin. You will receive requests.",
-        "cancelled": "❌ Cancelled. Tap “📝 Submit request” to start again.",
+        "not_admin": "Admin not set. Use /whoami and set ADMIN_ID in Render.",
+        "admin_set": "✅ You are set as admin.",
+        "cancelled": "❌ Cancelled.",
         "export_ok": "📎 Sending current Excel file.",
         "export_none": "🗂 File not created yet (no requests).",
         "cleared": "🧹 Done: Excel removed.",
         "no_rights": "Only the admin can use this command.",
+        "whoami": "🆔 Your chat_id: <code>{}</code>\nTip: add it to Render → Environment as <code>ADMIN_ID</code>.",
     }
 }
 
-# ── ВСПОМОГАТЕЛЬНОЕ ───────────────────────────────────────────────────────────
+# ── Хелперы ───────────────────────────────────────────────────────────────────
 def get_lang(uid: int) -> str:
     return user_lang.get(uid, "ru")
 
@@ -130,26 +138,56 @@ def render_card(d: Dict[str, str]) -> str:
         f"<b>Email:</b> {d.get('email','—')}"
     )
 
-def load_admin_id():
-    global ADMIN_ID
+def load_admin_id_from_file() -> Optional[int]:
     if os.path.exists(ADMIN_FILE):
         try:
-            ADMIN_ID = int(open(ADMIN_FILE, "r", encoding="utf-8").read().strip())
+            return int(open(ADMIN_FILE, "r", encoding="utf-8").read().strip())
         except Exception:
-            ADMIN_ID = None
+            return None
+    return None
 
-def save_admin_id(admin_id: int):
-    with open(ADMIN_FILE, "w", encoding="utf-8") as f:
-        f.write(str(admin_id))
+def save_admin_id_to_file(admin_id: int):
+    try:
+        with open(ADMIN_FILE, "w", encoding="utf-8") as f:
+            f.write(str(admin_id))
+    except Exception as e:
+        log.warning("Не удалось сохранить admin_id.txt: %s", e)
 
-# ── EXCEL ──────────────────────────────────────────────────────────────────────
-def excel_append(lang: str, data: Dict[str, str], user):
-    """Добавляет строку в requests.xlsx. При первом запуске создаёт файл и шапку."""
+def bootstrap_admin_from_env():
+    global ADMIN_ID
+    # 1) Жёстко заданный chat_id
+    if ADMIN_ID_ENV:
+        try:
+            ADMIN_ID = int(ADMIN_ID_ENV)
+            log.info("ADMIN_ID задан из ENV: %s", ADMIN_ID)
+            return
+        except ValueError:
+            log.warning("ADMIN_ID в ENV не число: %r", ADMIN_ID_ENV)
+    # 2) Попытка прочитать кэш-файл (если Render не перезапускал контейнер)
+    file_id = load_admin_id_from_file()
+    if file_id:
+        ADMIN_ID = file_id
+        log.info("ADMIN_ID восстановлен из файла: %s", ADMIN_ID)
+
+def maybe_auto_claim_admin(user: User):
+    """Если ADMIN_ID ещё не установлен, а username совпал с ADMIN_USERNAME_ENV— назначаем."""
+    global ADMIN_ID
+    if ADMIN_ID is None and ADMIN_USERNAME_ENV:
+        uname = (user.username or "").lower()
+        if uname == ADMIN_USERNAME_ENV:
+            ADMIN_ID = user.id
+            save_admin_id_to_file(ADMIN_ID)
+            log.info("ADMIN_ID автоматически назначен по username=%s: %s", uname, ADMIN_ID)
+            return True
+    return False
+
+# ── Excel ─────────────────────────────────────────────────────────────────────
+def excel_append(lang: str, data: Dict[str, str], user: User):
     try:
         from openpyxl import Workbook, load_workbook
         from openpyxl.utils import get_column_letter
     except Exception as e:
-        log.warning("openpyxl не установлен/недоступен: %s", e)
+        log.warning("openpyxl недоступен: %s", e)
         return
 
     headers = ["Timestamp(UTC)", "Lang", "FIO+Company", "Phone", "Telegram",
@@ -173,23 +211,25 @@ def excel_append(lang: str, data: Dict[str, str], user):
         f"@{data.get('tg','').lstrip('@')}",
         data.get("task", ""),
         data.get("email", ""),
-        getattr(user, "id", ""),
-        f"@{getattr(user, 'username', '')}" if getattr(user, "username", None) else "",
+        user.id,
+        f"@{user.username}" if user.username else "",
     ]
     ws.append(row)
 
-    if ws.max_row == 2:  # первая запись — зададим ширины колонок
+    if ws.max_row == 2:
         for col in range(1, ws.max_column + 1):
+            from openpyxl.utils import get_column_letter
             col_letter = get_column_letter(col)
             max_len = max(len(str(cell.value)) if cell.value else 0 for cell in ws[col_letter])
             ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
 
     wb.save(EXCEL_FILE)
 
-# ── ХЭНДЛЕРЫ ───────────────────────────────────────────────────────────────────
+# ── Обработчики ───────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    lang = get_lang(uid)
+    user = update.effective_user
+    maybe_auto_claim_admin(user)
+    lang = get_lang(user.id)
     await update.message.reply_text(
         f"{T[lang]['welcome']}\n\n{T[lang]['choose_lang']}",
         parse_mode="HTML",
@@ -197,22 +237,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручное закрепление админа (полезно вне Render). На Render лучше задать ADMIN_ID/ADMIN_USERNAME."""
     global ADMIN_ID
-    ADMIN_ID = update.effective_user.id
-    save_admin_id(ADMIN_ID)
-    lang = get_lang(ADMIN_ID)
+    user = update.effective_user
+    ADMIN_ID = user.id
+    save_admin_id_to_file(ADMIN_ID)
+    lang = get_lang(user.id)
     await update.message.reply_text(T[lang]["admin_set"])
 
-async def cmd_pingadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_ID:
-        await context.bot.send_message(chat_id=ADMIN_ID, text="✅ Test to admin OK")
-        await update.message.reply_text("Пробная отправка админу отправлена.")
-    else:
-        await update.message.reply_text(T[get_lang(update.effective_user.id)]["not_admin"])
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    lang = get_lang(uid)
+    await update.message.reply_text(T[lang]["whoami"].format(uid), parse_mode="HTML")
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(update.effective_user.id)
-    if update.effective_user.id != ADMIN_ID:
+    user = update.effective_user
+    maybe_auto_claim_admin(user)
+    lang = get_lang(user.id)
+    if user.id != ADMIN_ID:
         await update.message.reply_text(T[lang]["no_rights"]); return
     if not os.path.exists(EXCEL_FILE):
         await update.message.reply_text(T[lang]["export_none"]); return
@@ -224,8 +266,10 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error("Export send failed: %s", e)
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(update.effective_user.id)
-    if update.effective_user.id != ADMIN_ID:
+    user = update.effective_user
+    maybe_auto_claim_admin(user)
+    lang = get_lang(user.id)
+    if user.id != ADMIN_ID:
         await update.message.reply_text(T[lang]["no_rights"]); return
     try:
         if os.path.exists(EXCEL_FILE):
@@ -237,7 +281,9 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
+    user = q.from_user
+    maybe_auto_claim_admin(user)
+    uid = user.id
     lang = get_lang(uid)
     data = q.data or ""
 
@@ -256,7 +302,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(T[lang]["form_started"], parse_mode="HTML"); return
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    user = update.effective_user
+    maybe_auto_claim_admin(user)
+    uid = user.id
     lang = get_lang(uid)
     txt = (update.message.text or "").strip()
 
@@ -296,7 +344,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
+    user = q.from_user
+    maybe_auto_claim_admin(user)
+    uid = user.id
     lang = get_lang(uid)
     d = forms.get(uid, {}).get("data", {})
 
@@ -307,26 +357,22 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "form:confirm":
         if ADMIN_ID:
             try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID, text=f"{T[lang]['sent_admin']}\n\n{render_card(d)}", parse_mode="HTML"
-                )
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"{T[lang]['sent_admin']}\n\n{render_card(d)}", parse_mode="HTML")
             except Exception as e:
                 log.error("Send to admin failed: %s", e)
         else:
             await q.message.reply_text(T[lang]["not_admin"])
-
         try:
-            excel_append(lang, d, q.from_user)
+            excel_append(lang, d, user)
         except Exception as e:
             log.error("Excel append failed: %s", e)
-
         await q.edit_message_text(T[lang]["sent_user"], parse_mode="HTML", reply_markup=main_menu(lang))
         forms.pop(uid, None); return
 
-# ── ЗАПУСК: локально — polling; на Render Web — webhook ──────────────────────
+# ── Запуск (webhook на Render, polling локально) ─────────────────────────────
 def run(app):
-    base_url = os.getenv("RENDER_EXTERNAL_URL")      # Render задаёт, если это Web Service
-    port = int(os.getenv("PORT", "10000"))           # Render выдаёт порт через env
+    base_url = os.getenv("RENDER_EXTERNAL_URL")
+    port = int(os.getenv("PORT", "10000"))
 
     if base_url:
         path = f"/webhook/{BOT_TOKEN}"
@@ -344,12 +390,12 @@ def run(app):
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
-    load_admin_id()
+    bootstrap_admin_from_env()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("pingadmin", cmd_pingadmin))
+    app.add_handler(CommandHandler("admin", cmd_admin))     # опционально
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("clear", cmd_clear))
 
