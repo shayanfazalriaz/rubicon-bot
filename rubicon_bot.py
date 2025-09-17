@@ -1,6 +1,7 @@
 # rubicon_bot.py — Rubicon Production: RU/UZ/EN + Excel + webhook (Render)
 # Требует: python-telegram-bot[webhooks]==20.7, openpyxl
 # Новое: REQ-ID, статусы, /stats, /list, ADMIN_CHAT_ID, валидация телефона/почты, защита /admin
+# + ДОБАВЛЕНО: команда /alive и HTTP эндпоинт /health (для Render keepalive)
 
 import os
 import re
@@ -15,6 +16,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
+from aiohttp import web  # <── добавлено для /health и / (keepalive)
 
 # ── ENV / CONFIG ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -355,6 +357,7 @@ def next_request_id() -> str:
     except Exception:
         # fallback на время
         return f"{REQ_PREFIX}{datetime.utcnow().strftime('%m%d%H%M%S')}"
+
 # ── Валидация ────────────────────────────────────────────────────────────────
 def normalize_phone(raw: str) -> Tuple[str, bool]:
     """
@@ -416,6 +419,10 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = get_lang(uid)
     await update.message.reply_text(T[lang]["whoami"].format(uid), parse_mode="HTML")
+
+# 🆕 /alive — проверка «жив ли сервис»
+async def cmd_alive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot is alive (Render Web Service up).")
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -618,10 +625,25 @@ def run(app):
     base_url = os.getenv("RENDER_EXTERNAL_URL")
     port = int(os.getenv("PORT", "10000"))
     if base_url:
+        # Aiohttp-приложение с эндпоинтами для keepalive
+        aio = web.Application()
+
+        async def health(_request):
+            return web.Response(text="ok")
+
+        async def root(_request):
+            return web.Response(text="Rubicon bot is running")
+
+        aio.router.add_get("/health", health)
+        aio.router.add_get("/", root)
+
+        # Вебхук Telegram
         path = f"/webhook/{BOT_TOKEN}"
         webhook_url = f"{base_url}{path}"
         print(f">>> Using webhook on {webhook_url}")
+
         app.run_webhook(
+            web_app=aio,                 # <── ВАЖНО: наш aiohttp app
             listen="0.0.0.0",
             port=port,
             url_path=path,
@@ -643,6 +665,7 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("alive", cmd_alive))  # <── добавлено
 
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^(set_lang:(ru|uz|en)|lang:open|form:start|st:.+)$"))
     app.add_handler(CallbackQueryHandler(on_form_control, pattern="^form:(confirm|cancel)$"))
