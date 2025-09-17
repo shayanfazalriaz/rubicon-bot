@@ -1,7 +1,10 @@
 # rubicon_bot.py — Rubicon Production: RU/UZ/EN + Excel + webhook (Render)
 # Требует: python-telegram-bot[webhooks]==20.7, openpyxl
-# Новое: REQ-ID, статусы, /stats, /list, ADMIN_CHAT_ID, валидация телефона/почты, защита /admin
-# + ДОБАВЛЕНО: команда /alive и HTTP эндпоинт /health (для Render keepalive)
+# Новое в этой версии:
+#  - Архивирование каждой заявки в приватный Telegram-канал (перманентное хранение)
+#  - /alive (быстрая проверка, что бот жив)
+#  - Всё остальное — как у тебя: REQ-ID, статусы, /stats, /list, ADMIN_CHAT_ID,
+#    валидация телефона/почты, защита /admin, Excel-экспорт
 
 import os
 import re
@@ -16,7 +19,6 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from aiohttp import web  # <── добавлено для /health и / (keepalive)
 
 # ── ENV / CONFIG ──────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -31,6 +33,10 @@ ADMIN_KEY_ENV = os.getenv("ADMIN_KEY", "").strip()  # optional секрет дл
 # Опционально: командный чат/канал (обычно отрицательное число для групп)
 # Пример: -1001234567890
 ADMIN_CHAT_ID_ENV = os.getenv("ADMIN_CHAT_ID")
+
+# 🔷 НОВОЕ: архивный канал для перманентного хранения
+# Приватный канал, куда бот шлёт копию каждой заявки (навечно в Telegram)
+ARCHIVE_CHAT_ID_ENV = os.getenv("ARCHIVE_CHAT_ID")
 
 ADMIN_FILE = "admin_id.txt"    # кэш (на free Render может пропадать)
 EXCEL_FILE = "requests.xlsx"   # локальный Excel (/export, /list, /stats)
@@ -81,6 +87,7 @@ T = {
         "status_set": "Статус заявки {} → <b>{}</b>",
         "stats": "📊 Статистика:\nСегодня: <b>{}</b>\n7 дней: <b>{}</b>\nВсего: <b>{}</b>",
         "list_header": "🗂 Последние заявки:",
+        "alive": "✅ Bot is alive (webhook/polling OK).",
     },
     "uz": {
         "welcome": "👋 <b>Rubicon Production</b>\nTilni tanlang va «Ariza yuborish» tugmasini bosing.",
@@ -115,6 +122,7 @@ T = {
         "status_set": "Ariza holati {} → <b>{}</b>",
         "stats": "📊 Statistika:\nBugun: <b>{}</b>\n7 kun: <b>{}</b>\nJami: <b>{}</b>",
         "list_header": "🗂 So‘nggi arizalar:",
+        "alive": "✅ Bot ishlayapti.",
     },
     "en": {
         "welcome": "👋 <b>Rubicon Production</b>\nChoose language and tap “Submit request”.",
@@ -149,6 +157,7 @@ T = {
         "status_set": "Request {} status → <b>{}</b>",
         "stats": "📊 Stats:\nToday: <b>{}</b>\n7 days: <b>{}</b>\nTotal: <b>{}</b>",
         "list_header": "🗂 Latest requests:",
+        "alive": "✅ Bot is alive.",
     }
 }
 
@@ -230,6 +239,16 @@ def get_admin_chat_id() -> Optional[int]:
         return None
     try:
         return int(ADMIN_CHAT_ID_ENV)
+    except ValueError:
+        return None
+
+# 🔷 НОВОЕ: ID архивного канала
+def get_archive_chat_id() -> Optional[int]:
+    val = ARCHIVE_CHAT_ID_ENV
+    if not val:
+        return None
+    try:
+        return int(val)
     except ValueError:
         return None
 
@@ -373,7 +392,6 @@ def normalize_phone(raw: str) -> Tuple[str, bool]:
         return raw, True
     if s.startswith("+"):
         return f"+{digits}", False
-    # если начиналось без '+', нормализуем
     was_weird = True
     return f"+{digits}", was_weird
 
@@ -390,6 +408,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=lang_menu(lang)
     )
+
+async def cmd_alive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.effective_user.id)
+    await update.message.reply_text(T[lang]["alive"])
 
 # /admin — защищённая
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,10 +441,6 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = get_lang(uid)
     await update.message.reply_text(T[lang]["whoami"].format(uid), parse_mode="HTML")
-
-# 🆕 /alive — проверка «жив ли сервис»
-async def cmd_alive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is alive (Render Web Service up).")
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -472,7 +490,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_rows = []
     for req_id, ts, fio in rows:
         txt.append(f"• <b>{req_id}</b> — {fio}  ({ts})")
-        # для каждой заявки — быстрые кнопки статуса
         kb_rows.append([
             InlineKeyboardButton("✅ В работе", callback_data=f"st:{req_id}:INPROG"),
             InlineKeyboardButton("⏳ Ожидание", callback_data=f"st:{req_id}:WAIT"),
@@ -507,7 +524,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(T[lang]["form_started"], parse_mode="HTML"); return
 
     if data.startswith("st:"):
-        # формат: st:<REQ-ID>:<CODE>
         if user.id != ADMIN_ID:
             await q.message.reply_text(T[lang]["no_rights"]); return
         parts = data.split(":")
@@ -584,16 +600,14 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(T[lang]["cancelled"], parse_mode="HTML", reply_markup=main_menu(lang)); return
 
     if q.data == "form:confirm":
-        # назначаем ID
+        # 1) Назначаем ID и пишем в локальный Excel (как раньше, чтобы /export и статистика работали)
         req_id = next_request_id()
-
-        # 1) Запись в Excel
         try:
             excel_append_new(lang, req_id, d, user)
         except Exception as e:
             log.error("Excel append failed: %s", e)
 
-        # 2) Отправка админу и (опционально) в командный чат
+        # 2) Готовим карточку + кнопки статуса
         text = f"{T[lang]['sent_admin']}\n\n{render_card(req_id, d)}"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ В работе", callback_data=f"st:{req_id}:INPROG"),
@@ -601,6 +615,7 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Отказ",   callback_data=f"st:{req_id}:REJ"),
         ]])
 
+        # 3) Отправка админу
         if ADMIN_ID:
             try:
                 await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=kb)
@@ -609,14 +624,41 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.message.reply_text(T[lang]["not_admin"])
 
-        admin_chat = get_admin_chat_id()
-        if admin_chat:
+        # 4) Опционально — в командный чат
+        team_chat = get_admin_chat_id()
+        if team_chat:
             try:
-                await context.bot.send_message(chat_id=admin_chat, text=text, parse_mode="HTML", reply_markup=kb)
+                await context.bot.send_message(chat_id=team_chat, text=text, parse_mode="HTML", reply_markup=kb)
             except Exception as e:
                 log.error("Send to team chat failed: %s", e)
 
-        # 3) Ответ пользователю
+        # 🔷 5) НОВОЕ — отправка в архивный канал (перманентное хранение в Telegram)
+        archive_chat = get_archive_chat_id()
+        if archive_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=archive_chat,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    disable_notification=True
+                )
+                # Дополнительно — легко копируемая CSV-строка (опционально)
+                csv_line = (
+                    f'{req_id},{lang.upper()},"{(d.get("fio_company","") or "").replace("\"","\'")}",'
+                    f'"{d.get("phone","")}","@{d.get("tg","").lstrip("@")}","{(d.get("task","") or "").replace("\"","\'")}",'
+                    f'"{d.get("email","")}",{user.id},"@{user.username or ""}"'
+                )
+                await context.bot.send_message(
+                    chat_id=archive_chat,
+                    text=f"<code>{csv_line}</code>",
+                    parse_mode="HTML",
+                    disable_notification=True
+                )
+            except Exception as e:
+                log.error("Send to archive channel failed: %s", e)
+
+        # 6) Ответ пользователю
         await q.edit_message_text(T[lang]["sent_user"], parse_mode="HTML", reply_markup=main_menu(lang))
         forms.pop(uid, None); return
 
@@ -639,19 +681,18 @@ def run(app):
         print(">>> Using polling (local run)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 def main():
     bootstrap_admin_from_env()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("alive", cmd_alive))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("alive", cmd_alive))  # <── добавлено
 
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^(set_lang:(ru|uz|en)|lang:open|form:start|st:.+)$"))
     app.add_handler(CallbackQueryHandler(on_form_control, pattern="^form:(confirm|cancel)$"))
@@ -662,4 +703,3 @@ def main():
 if __name__ == "__main__":
     print(">>> Rubicon bot booting…")
     main()
-
