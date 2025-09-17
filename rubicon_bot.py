@@ -625,25 +625,10 @@ def run(app):
     base_url = os.getenv("RENDER_EXTERNAL_URL")
     port = int(os.getenv("PORT", "10000"))
     if base_url:
-        # Aiohttp-приложение с эндпоинтами для keepalive
-        aio = web.Application()
-
-        async def health(_request):
-            return web.Response(text="ok")
-
-        async def root(_request):
-            return web.Response(text="Rubicon bot is running")
-
-        aio.router.add_get("/health", health)
-        aio.router.add_get("/", root)
-
-        # Вебхук Telegram
         path = f"/webhook/{BOT_TOKEN}"
         webhook_url = f"{base_url}{path}"
         print(f">>> Using webhook on {webhook_url}")
-
         app.run_webhook(
-            web_app=aio,                 # <── ВАЖНО: наш aiohttp app
             listen="0.0.0.0",
             port=port,
             url_path=path,
@@ -653,6 +638,7 @@ def run(app):
     else:
         print(">>> Using polling (local run)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 def main():
     bootstrap_admin_from_env()
@@ -676,3 +662,4 @@ def main():
 if __name__ == "__main__":
     print(">>> Rubicon bot booting…")
     main()
+
