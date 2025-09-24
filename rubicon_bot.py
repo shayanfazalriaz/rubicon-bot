@@ -456,7 +456,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error("Export send failed: %s", e)
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_clear(update: Update, Context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     lang = get_lang(user.id)
     if user.id != ADMIN_ID:
@@ -632,29 +632,17 @@ async def on_form_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error("Send to team chat failed: %s", e)
 
-        # 🔷 5) НОВОЕ — отправка в архивный канал (перманентное хранение в Telegram)
+        # 🔷 5) ОТПРАВКА В АРХИВ — ТОЛЬКО ЧИСТАЯ КАРТОЧКА (БЕЗ КНОПОК И CSV)
         archive_chat = get_archive_chat_id()
         if archive_chat:
             try:
                 await context.bot.send_message(
                     chat_id=archive_chat,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                    disable_notification=True
-                )
-                # Дополнительно — легко копируемая CSV-строка (опционально)
-                csv_line = (
-                    f'{req_id},{lang.upper()},"{(d.get("fio_company","") or "").replace("\"","\'")}",'
-                    f'"{d.get("phone","")}","@{d.get("tg","").lstrip("@")}","{(d.get("task","") or "").replace("\"","\'")}",'
-                    f'"{d.get("email","")}",{user.id},"@{user.username or ""}"'
-                )
-                await context.bot.send_message(
-                    chat_id=archive_chat,
-                    text=f"<code>{csv_line}</code>",
+                    text=render_card(req_id, d),  # чистая карточка
                     parse_mode="HTML",
                     disable_notification=True
                 )
+                # ❌ Удалено: никакого reply_markup и никакой CSV-строки
             except Exception as e:
                 log.error("Send to archive channel failed: %s", e)
 
